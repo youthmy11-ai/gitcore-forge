@@ -13,8 +13,12 @@ const HEALTHZ_BUF = Buffer.from('{"ok":true}', 'utf8');
 const UNAUTH_BUF = Buffer.from('{"message":"Requires authentication"}', 'utf8');
 const NOT_FOUND_BUF = Buffer.from('{"message":"Not Found"}', 'utf8');
 const EMPTY_BUF = Buffer.alloc(0);
+const METHOD_NOT_ALLOWED_BUF = Buffer.from('{"message":"Method Not Allowed"}', 'utf8');
+const BAD_PATH_BUF = Buffer.from('{"message":"Malformed URL path"}', 'utf8');
+const HEALTHZ_HEADERS = ['content-type', 'application/json; charset=utf-8', 'content-length', String(HEALTHZ_BUF.length)];
+const EMPTY_MCP_HEADERS = ['content-type', 'application/json; charset=utf-8', 'x-github-request-id', ''];
 
-function readBodyFast(req: IncomingMessage, cb: (body: Buffer) => void): void {
+export function readBodyFast(req: IncomingMessage, cb: (body: Buffer) => void): void {
   const lenHdr = req.headers['content-length'];
   const teHdr = req.headers['transfer-encoding'];
   if ((req.method === 'GET' || req.method === 'HEAD') && !lenHdr && !teHdr) {
@@ -50,18 +54,15 @@ function readBodyFast(req: IncomingMessage, cb: (body: Buffer) => void): void {
       cb(Buffer.concat(extraChunks, total));
     }
   });
+  // An interrupted upload must never dispatch a partial JSON document or pack.
+  req.on('error', () => {});
 }
 
-function isAuthorized(req: IncomingMessage, expectedToken: string): boolean {
-  const auth = req.headers.authorization;
-  if (typeof auth !== 'string' || auth.length < 8) return false;
-  // Fast case-insensitive check for 'bearer '
-  const prefix = auth.slice(0, 7).toLowerCase();
-  if (prefix !== 'bearer ') return false;
-  const token = auth.slice(7).trim();
-  if (token === '') return false;
-  if (expectedToken !== '' && token !== expectedToken) return false;
-  return true;
+function equalToken(auth: string, offset: number, expected: string): boolean {
+  if (auth.length - offset !== expected.length) return false;
+  let diff = 0;
+  for (let i = 0; i < expected.length; i++) diff |= auth.charCodeAt(offset + i) ^ expected.charCodeAt(i);
+  return diff === 0;
 }
 
 function parseGitPath(pathname: string): { owner: string; repo: string; tail: string } | null {
@@ -85,12 +86,23 @@ function parseGitPath(pathname: string): { owner: string; repo: string; tail: st
 export function createApp(options: AppOptions = {}): Server {
   const store = new ForgeStore();
   const expectedToken = options.token ?? process.env.MAKEFUN_SHOP_TOKEN ?? '';
-  const expectedBearer = expectedToken !== '' ? `Bearer ${expectedToken}` : '';
 
   const checkAuth = (req: IncomingMessage): boolean => {
     const auth = req.headers.authorization;
-    if (expectedBearer !== '' && auth === expectedBearer) return true;
-    return isAuthorized(req, expectedToken);
+    if (typeof auth !== 'string') return false;
+    let offset: number;
+    // Compare the scheme without slicing/lowercasing the entire authorization value.
+    if (auth.length >= 7 && (auth.charCodeAt(0) | 32) === 98 &&
+        (auth.charCodeAt(1) | 32) === 101 && (auth.charCodeAt(2) | 32) === 97 &&
+        (auth.charCodeAt(3) | 32) === 114 && (auth.charCodeAt(4) | 32) === 101 &&
+        (auth.charCodeAt(5) | 32) === 114 && auth.charCodeAt(6) === 32) offset = 7;
+    else if (auth.length >= 6 && (auth.charCodeAt(0) | 32) === 116 &&
+        (auth.charCodeAt(1) | 32) === 111 && (auth.charCodeAt(2) | 32) === 107 &&
+        (auth.charCodeAt(3) | 32) === 101 && (auth.charCodeAt(4) | 32) === 110 &&
+        auth.charCodeAt(5) === 32) offset = 6;
+    else return false;
+    if (expectedToken === '') return auth.slice(offset).trim() !== '';
+    return equalToken(auth, offset, expectedToken);
   };
 
   const server = createServer(
@@ -107,10 +119,7 @@ export function createApp(options: AppOptions = {}): Server {
       const method = req.method ?? 'GET';
 
       if (method === 'GET' && pathname === '/healthz') {
-        res.writeHead(200, {
-          'content-type': 'application/json; charset=utf-8',
-          'content-length': HEALTHZ_BUF.length,
-        });
+        res.writeHead(200, HEALTHZ_HEADERS);
         res.end(HEALTHZ_BUF);
         return;
       }
@@ -124,7 +133,8 @@ export function createApp(options: AppOptions = {}): Server {
           return;
         }
         const subPath = pathname.length === 7 ? '' : pathname.slice(7);
-        if (method === 'GET' && !req.headers['content-length'] && !req.headers['transfer-encoding']) {
+        if (method === 'GET' || method === 'HEAD') {
+          if (req.headers['content-length'] || req.headers['transfer-encoding']) req.resume();
           handleRestRequest(store, req, res, subPath, queryStr, EMPTY_BUF, requestId);
           return;
         }
@@ -157,15 +167,13 @@ export function createApp(options: AppOptions = {}): Server {
           return;
         }
         if (method === 'DELETE') {
-          res.writeHead(204, {
-            'content-type': 'application/json; charset=utf-8',
-            'x-github-request-id': requestId,
-          });
+          EMPTY_MCP_HEADERS[3] = requestId;
+          res.writeHead(204, EMPTY_MCP_HEADERS);
           res.end();
           return;
         }
         if (method !== 'POST') {
-          sendJsonBuffer(res, 405, Buffer.from('{"message":"Method Not Allowed"}', 'utf8'), requestId);
+          sendJsonBuffer(res, 405, METHOD_NOT_ALLOWED_BUF, requestId);
           return;
         }
         readBodyFast(req, (body) => {
@@ -175,7 +183,13 @@ export function createApp(options: AppOptions = {}): Server {
       }
 
       // Smart HTTP Git surface
-      const gitRoute = parseGitPath(pathname);
+      let gitRoute: ReturnType<typeof parseGitPath>;
+      try {
+        gitRoute = parseGitPath(pathname);
+      } catch {
+        sendJsonBuffer(res, 400, BAD_PATH_BUF, requestId);
+        return;
+      }
       if (gitRoute) {
         if (expectedToken !== '' && !checkAuth(req)) {
           sendJsonBuffer(res, 401, UNAUTH_BUF, requestId);

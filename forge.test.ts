@@ -388,3 +388,27 @@ test('main.ts enforces MAKEFUN_ENV_URL requirement and completes register/health
     await new Promise<void>((resolve) => mockEnv.close(() => resolve()));
   }
 });
+
+test('ForgeStore clock minute cache matches ISO-8601 and DELETE /mcp sets request-id header', async () => {
+  const store = new ForgeStore();
+  const repo = store.createRepo({ name: 'clock-check' });
+  for (let i = 0; i < 65; i++) {
+    const issue = store.createIssue(repo, { title: `issue-${i}` });
+    assert.equal(issue.createdAt, new Date(issue.createdAtEpoch * 1000).toISOString());
+    const parsed = JSON.parse(issue.cachedJson.toString('utf8'));
+    assert.equal(parsed.created_at, issue.createdAt);
+    assert.equal(parsed.user.login, 'adaiversen');
+  }
+
+  const srv = await listenEphemeral('clock-tok');
+  try {
+    const res = await fetch(`${srv.baseUrl}/mcp`, {
+      method: 'DELETE',
+      headers: { authorization: 'Bearer clock-tok' },
+    });
+    assert.equal(res.status, 204);
+    assert.ok(res.headers.get('x-github-request-id'));
+  } finally {
+    await srv.close();
+  }
+});

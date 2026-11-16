@@ -60,8 +60,7 @@ export function isOid(value: string): boolean {
 }
 
 export function hashObject(type: GitObjectType, data: Buffer): string {
-  const header = Buffer.from(`${type} ${data.length}\u0000`, 'ascii');
-  return createHash('sha1').update(header).update(data).digest('hex');
+  return createHash('sha1').update(`${type} ${data.length}\u0000`, 'ascii').update(data).digest('hex');
 }
 
 export function makeObject(type: GitObjectType, data: Buffer, compressed?: Buffer): GitObject {

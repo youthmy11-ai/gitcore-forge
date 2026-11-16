@@ -186,9 +186,16 @@ function normalizeBranchName(input: string, ownerLogin: string): string {
   return s;
 }
 
+const TWO_DIGITS = Array.from({ length: 60 }, (_, i) => (i < 10 ? `0${i}` : String(i)));
+const VIEWER_PUBLIC = { login: VIEWER.login, id: VIEWER.id };
+const EMPTY_LABEL_RECORDS: LabelRecord[] = [];
+const EMPTY_LABEL_PAYLOADS: Array<Record<string, unknown>> = [];
+
 export class ForgeStore {
   readonly baseEpochSec: number;
   private clockOffset = 0;
+  private cachedMinute = -1;
+  private cachedMinutePrefix = '';
   private reqCounter = 0;
   private nextRepoIdVal = 1;
   private nextItemIdVal = 1;
@@ -215,9 +222,15 @@ export class ForgeStore {
   private nextClock(): { epochSec: number; iso: string } {
     this.clockOffset += 1;
     const epochSec = this.baseEpochSec + this.clockOffset;
+    const minute = Math.floor(epochSec / 60);
+    if (minute !== this.cachedMinute) {
+      this.cachedMinute = minute;
+      this.cachedMinutePrefix = new Date(minute * 60_000).toISOString().slice(0, 17);
+    }
+    const sec = epochSec - minute * 60;
     return {
       epochSec,
-      iso: new Date(epochSec * 1000).toISOString(),
+      iso: `${this.cachedMinutePrefix}${TWO_DIGITS[sec]!}.000Z`,
     };
   }
 
@@ -665,7 +678,7 @@ export class ForgeStore {
   private refreshIssueCache(issue: IssueRecord): void {
     const labels =
       issue.labels.length === 0
-        ? []
+        ? EMPTY_LABEL_PAYLOADS
         : issue.labels.map((l) => ({
             id: l.id,
             node_id: l.nodeId,
@@ -682,10 +695,9 @@ export class ForgeStore {
       state: issue.state,
       labels,
       comments: issue.comments.length,
-      user: {
-        login: issue.userLogin,
-        id: issue.userId,
-      },
+      user: issue.userLogin === VIEWER.login && issue.userId === VIEWER.id
+        ? VIEWER_PUBLIC
+        : { login: issue.userLogin, id: issue.userId },
       created_at: issue.createdAt,
       updated_at: issue.updatedAt,
       closed_at: issue.closedAt,
@@ -701,8 +713,9 @@ export class ForgeStore {
     if (typeof title !== 'string' || title.trim() === '') {
       throw new StoreError(422, 'Validation Failed: title is required', 'invalid');
     }
-    const resolvedLabels: LabelRecord[] = [];
-    if (input.labels !== undefined) {
+    let resolvedLabels = EMPTY_LABEL_RECORDS;
+    if (input.labels !== undefined && input.labels.length > 0) {
+      resolvedLabels = [];
       for (const labelName of input.labels) {
         const found = repo.labels.get(labelName);
         if (!found) {
@@ -731,7 +744,7 @@ export class ForgeStore {
       updatedAt: iso,
       closedAt: null,
       comments: [],
-      cachedJson: Buffer.alloc(0),
+      cachedJson: undefined as unknown as Buffer,
     };
     this.refreshIssueCache(issue);
     repo.issues.set(number, issue);

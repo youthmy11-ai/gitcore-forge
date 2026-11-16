@@ -5,6 +5,11 @@ function fastDecode(seg: string): string {
   return seg.indexOf('%') >= 0 ? decodeURIComponent(seg) : seg;
 }
 
+// writeHead consumes these arrays synchronously; no response retains the template.
+// Keep Content-Length: it lets end(Buffer) send one unchunked HTTP response.
+const JSON_HEADERS = ['content-type', 'application/json; charset=utf-8', 'content-length', '', 'x-github-request-id', ''];
+const EMPTY_HEADERS = ['content-type', 'application/json; charset=utf-8', 'x-github-request-id', ''];
+
 export function sendJson(
   res: ServerResponse,
   status: number,
@@ -13,6 +18,10 @@ export function sendJson(
   extraHeaders?: Record<string, string>,
 ): void {
   const buf = Buffer.from(JSON.stringify(payload), 'utf8');
+  if (!extraHeaders) {
+    sendJsonBuffer(res, status, buf, requestId);
+    return;
+  }
   const headers: Record<string, string | number> = {
     'content-type': 'application/json; charset=utf-8',
     'content-length': buf.length,
@@ -26,19 +35,15 @@ export function sendJson(
 }
 
 export function sendJsonBuffer(res: ServerResponse, status: number, buf: Buffer, requestId: string): void {
-  res.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'content-length': buf.length,
-    'x-github-request-id': requestId,
-  });
+  JSON_HEADERS[3] = String(buf.length);
+  JSON_HEADERS[5] = requestId;
+  res.writeHead(status, JSON_HEADERS);
   res.end(buf);
 }
 
 function sendNoContent(res: ServerResponse, requestId: string): void {
-  res.writeHead(204, {
-    'content-type': 'application/json; charset=utf-8',
-    'x-github-request-id': requestId,
-  });
+  EMPTY_HEADERS[3] = requestId;
+  res.writeHead(204, EMPTY_HEADERS);
   res.end();
 }
 
@@ -64,9 +69,15 @@ function parseJsonBody(body: Buffer): Record<string, unknown> {
 }
 
 function parseIntStrict(raw: string): number | null {
-  if (!/^\d+$/.test(raw)) return null;
-  const n = Number(raw);
-  return Number.isSafeInteger(n) && n > 0 ? n : null;
+  if (raw.length === 0) return null;
+  let n = 0;
+  for (let i = 0; i < raw.length; i++) {
+    const digit = raw.charCodeAt(i) - 48;
+    if (digit < 0 || digit > 9) return null;
+    n = n * 10 + digit;
+    if (n > Number.MAX_SAFE_INTEGER) return null;
+  }
+  return n > 0 ? n : null;
 }
 
 function paginate<T>(
@@ -133,6 +144,8 @@ export function handleRestRequest(
   requestId: string,
 ): void {
   const method = req.method ?? 'GET';
+
+  try {
 
   // ULTRA-HOT PATH check before allocating URLSearchParams or splitting everything:
   // GET /repos/<owner>/<repo>/issues/<number>
@@ -213,7 +226,6 @@ export function handleRestRequest(
 
   const query = queryStr !== '' ? new URLSearchParams(queryStr) : null;
 
-  try {
     if (subPath === '' || subPath === '/') {
       if (method === 'GET') {
         sendJson(
@@ -653,6 +665,10 @@ export function handleRestRequest(
 
     sendNotFound(res, requestId);
   } catch (err) {
+    if (err instanceof URIError) {
+      sendJson(res, 400, { message: 'Malformed URL path' }, requestId);
+      return;
+    }
     if (err instanceof StoreError) {
       if (err.code === 'bad_json') {
         sendJsonBuffer(res, 400, BAD_JSON_BUF, requestId);
