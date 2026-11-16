@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { handleGitGetInfoRefs, handleGitPostService } from './git.ts';
 import { handleGraphqlRequest } from './graphql.ts';
 import { handleMcpRequest } from './mcp.ts';
-import { handleRestRequest, sendJsonBuffer } from './rest.ts';
+import { handleRestRequest, sendJsonBuffer, tryFastGetIssue, tryFastPostIssue } from './rest.ts';
 import { ForgeStore } from './store.ts';
 
 export interface AppOptions {
@@ -15,8 +15,6 @@ const NOT_FOUND_BUF = Buffer.from('{"message":"Not Found"}', 'utf8');
 const EMPTY_BUF = Buffer.alloc(0);
 const METHOD_NOT_ALLOWED_BUF = Buffer.from('{"message":"Method Not Allowed"}', 'utf8');
 const BAD_PATH_BUF = Buffer.from('{"message":"Malformed URL path"}', 'utf8');
-const HEALTHZ_HEADERS = ['content-type', 'application/json; charset=utf-8', 'content-length', String(HEALTHZ_BUF.length)];
-const EMPTY_MCP_HEADERS = ['content-type', 'application/json; charset=utf-8', 'x-github-request-id', ''];
 
 export function readBodyFast(req: IncomingMessage, cb: (body: Buffer) => void): void {
   const lenHdr = req.headers['content-length'];
@@ -58,13 +56,6 @@ export function readBodyFast(req: IncomingMessage, cb: (body: Buffer) => void): 
   req.on('error', () => {});
 }
 
-function equalToken(auth: string, offset: number, expected: string): boolean {
-  if (auth.length - offset !== expected.length) return false;
-  let diff = 0;
-  for (let i = 0; i < expected.length; i++) diff |= auth.charCodeAt(offset + i) ^ expected.charCodeAt(i);
-  return diff === 0;
-}
-
 function parseGitPath(pathname: string): { owner: string; repo: string; tail: string } | null {
   if (!pathname.startsWith('/')) return null;
   const s1 = pathname.indexOf('/', 1);
@@ -86,9 +77,11 @@ function parseGitPath(pathname: string): { owner: string; repo: string; tail: st
 export function createApp(options: AppOptions = {}): Server {
   const store = new ForgeStore();
   const expectedToken = options.token ?? process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  const expectedBearer = expectedToken !== '' ? `Bearer ${expectedToken}` : '';
 
   const checkAuth = (req: IncomingMessage): boolean => {
     const auth = req.headers.authorization;
+    if (expectedBearer !== '' && auth === expectedBearer) return true;
     if (typeof auth !== 'string') return false;
     let offset: number;
     // Compare the scheme without slicing/lowercasing the entire authorization value.
@@ -101,8 +94,9 @@ export function createApp(options: AppOptions = {}): Server {
         (auth.charCodeAt(3) | 32) === 101 && (auth.charCodeAt(4) | 32) === 110 &&
         auth.charCodeAt(5) === 32) offset = 6;
     else return false;
-    if (expectedToken === '') return auth.slice(offset).trim() !== '';
-    return equalToken(auth, offset, expectedToken);
+    const token = auth.slice(offset).trim();
+    if (token === '') return false;
+    return expectedToken === '' || token === expectedToken;
   };
 
   const server = createServer(
@@ -119,7 +113,9 @@ export function createApp(options: AppOptions = {}): Server {
       const method = req.method ?? 'GET';
 
       if (method === 'GET' && pathname === '/healthz') {
-        res.writeHead(200, HEALTHZ_HEADERS);
+        res.statusCode = 200;
+        res.setHeader('content-type', 'application/json; charset=utf-8');
+        res.setHeader('content-length', HEALTHZ_BUF.length);
         res.end(HEALTHZ_BUF);
         return;
       }
@@ -132,12 +128,29 @@ export function createApp(options: AppOptions = {}): Server {
           sendJsonBuffer(res, 401, UNAUTH_BUF, requestId);
           return;
         }
-        const subPath = pathname.length === 7 ? '' : pathname.slice(7);
-        if (method === 'GET' || method === 'HEAD') {
+        if (method === 'GET') {
           if (req.headers['content-length'] || req.headers['transfer-encoding']) req.resume();
+          if (qIdx < 0 && pathname.startsWith('/api/v3/repos/') && tryFastGetIssue(store, res, pathname, requestId)) {
+            return;
+          }
+          const subPath = pathname.length === 7 ? '' : pathname.slice(7);
           handleRestRequest(store, req, res, subPath, queryStr, EMPTY_BUF, requestId);
           return;
         }
+        if (method === 'HEAD') {
+          if (req.headers['content-length'] || req.headers['transfer-encoding']) req.resume();
+          const subPath = pathname.length === 7 ? '' : pathname.slice(7);
+          handleRestRequest(store, req, res, subPath, queryStr, EMPTY_BUF, requestId);
+          return;
+        }
+        if (method === 'POST' && qIdx < 0 && pathname.startsWith('/api/v3/repos/') && pathname.endsWith('/issues')) {
+          readBodyFast(req, (body) => {
+            if (tryFastPostIssue(store, res, pathname, body, requestId)) return;
+            handleRestRequest(store, req, res, pathname.slice(7), '', body, requestId);
+          });
+          return;
+        }
+        const subPath = pathname.length === 7 ? '' : pathname.slice(7);
         readBodyFast(req, (body) => {
           handleRestRequest(store, req, res, subPath, queryStr, body, requestId);
         });
@@ -167,8 +180,9 @@ export function createApp(options: AppOptions = {}): Server {
           return;
         }
         if (method === 'DELETE') {
-          EMPTY_MCP_HEADERS[3] = requestId;
-          res.writeHead(204, EMPTY_MCP_HEADERS);
+          res.statusCode = 204;
+          res.setHeader('content-type', 'application/json; charset=utf-8');
+          res.setHeader('x-github-request-id', requestId);
           res.end();
           return;
         }

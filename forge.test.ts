@@ -19,7 +19,7 @@ import {
   parseTree,
 } from './git-objects.ts';
 import { encodePktText, encodeSidebandPack } from './git.ts';
-import { ForgeStore, decodeNodeId, encodeNodeId } from './store.ts';
+import { ForgeStore, decodeNodeId, encodeNodeId, fastJsonString } from './store.ts';
 
 async function listenEphemeral(token = 'test-token'): Promise<{
   baseUrl: string;
@@ -408,6 +408,130 @@ test('ForgeStore clock minute cache matches ISO-8601 and DELETE /mcp sets reques
     });
     assert.equal(res.status, 204);
     assert.ok(res.headers.get('x-github-request-id'));
+  } finally {
+    await srv.close();
+  }
+});
+
+test('fastJsonString and issue cachedJson match JSON.stringify across special characters', () => {
+  const cases = [
+    '',
+    'plain ASCII title [bench 1]',
+    'quotes "double" and \'single\'',
+    'backslash \\ and path C:\\temp\\x',
+    'controls:\n\r\t\b\f\u0000\u001f',
+    'unicode — em-dash, 中文, 🚀 rocket',
+    'lone surrogate \ud800 end',
+  ];
+  for (const s of cases) {
+    assert.equal(fastJsonString(s), JSON.stringify(s));
+  }
+
+  const store = new ForgeStore();
+  const repo = store.createRepo({ name: 'json-eq' });
+  for (const text of cases) {
+    if (text.trim() === '') continue;
+    const issue = store.createIssue(repo, { title: text, body: text });
+    const expected = JSON.stringify({
+      id: issue.id,
+      node_id: issue.nodeId,
+      number: issue.number,
+      title: issue.title,
+      body: issue.body,
+      state: issue.state,
+      labels: [],
+      comments: 0,
+      user: { login: 'adaiversen', id: 1000 },
+      created_at: issue.createdAt,
+      updated_at: issue.updatedAt,
+      closed_at: null,
+    });
+    assert.equal(issue.cachedJson.toString('utf8'), expected);
+  }
+});
+
+test('fast receive-pack rejects corrupt packs atomically and preserves response headers', async () => {
+  const srv = await listenEphemeral('hdr-tok');
+  try {
+    const auth = { authorization: 'Bearer hdr-tok', 'content-type': 'application/json' };
+    const created = await fetch(`${srv.baseUrl}/api/v3/user/repos`, {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({ name: 'fast-git' }),
+    });
+    assert.equal(created.status, 201);
+    assert.equal(created.headers.get('content-type'), 'application/json; charset=utf-8');
+    assert.ok(Number(created.headers.get('content-length')) > 0);
+    assert.ok(created.headers.get('x-github-request-id'));
+
+    // Test case-insensitive bearer & token scheme fallback + 401 on wrong token
+    const tokenScheme = await fetch(`${srv.baseUrl}/api/v3/repos/adaiversen/fast-git`, {
+      headers: { authorization: 'token hdr-tok' },
+    });
+    assert.equal(tokenScheme.status, 200);
+    const badAuth = await fetch(`${srv.baseUrl}/api/v3/repos/adaiversen/fast-git`, {
+      headers: { authorization: 'Bearer wrong' },
+    });
+    assert.equal(badAuth.status, 401);
+
+    // Malformed pack checksum on single-command refs/heads/main push must be rejected cleanly
+    const b1 = Buffer.from('hello\n', 'utf8');
+    const b1Oid = hashObject('blob', b1);
+    const t1 = buildTree([{ mode: '100644', name: 'a.txt', oid: b1Oid }]);
+    const t1Oid = hashObject('tree', t1);
+    const c1 = buildCommit({
+      tree: t1Oid,
+      parents: [],
+      authorName: 'A',
+      authorEmail: 'a@example.invalid',
+      timestampSec: 1700000010,
+      message: 'init',
+    });
+    const c1Oid = hashObject('commit', c1);
+    const validPack = buildMinimalPack([
+      { type: 'blob', data: b1 },
+      { type: 'tree', data: t1 },
+      { type: 'commit', data: c1 },
+    ]);
+    const corruptPack = Buffer.from(validPack);
+    corruptPack[corruptPack.length - 1]! ^= 0xff;
+
+    const badPush = Buffer.concat([
+      encodePktText([`${ZERO_OID} ${c1Oid} refs/heads/main\u0000report-status\n`, 'flush']),
+      corruptPack,
+    ]);
+    const badRes = await fetch(`${srv.baseUrl}/adaiversen/fast-git.git/git-receive-pack`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer hdr-tok', 'content-type': 'application/x-git-receive-pack-request' },
+      body: badPush,
+    });
+    assert.equal(badRes.status, 200);
+    assert.equal(badRes.headers.get('cache-control'), 'no-cache');
+    assert.ok(badRes.headers.get('x-github-request-id'));
+    const badText = await badRes.text();
+    assert.ok(badText.includes('unpack packfile checksum mismatch'));
+    assert.ok(badText.includes('ng refs/heads/main unpacker error'));
+
+    // Good push right after must still succeed, and advertisement fast-path sets expected headers
+    const goodPush = Buffer.concat([
+      encodePktText([`${ZERO_OID} ${c1Oid} refs/heads/main\u0000report-status\n`, 'flush']),
+      validPack,
+    ]);
+    const goodRes = await fetch(`${srv.baseUrl}/adaiversen/fast-git.git/git-receive-pack`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer hdr-tok', 'content-type': 'application/x-git-receive-pack-request' },
+      body: goodPush,
+    });
+    assert.equal(goodRes.status, 200);
+    assert.ok((await goodRes.text()).includes('ok refs/heads/main'));
+
+    const infoRefs = await fetch(`${srv.baseUrl}/adaiversen/fast-git.git/info/refs?service=git-receive-pack`, {
+      headers: { authorization: 'Bearer hdr-tok' },
+    });
+    assert.equal(infoRefs.status, 200);
+    assert.equal(infoRefs.headers.get('content-type'), 'application/x-git-receive-pack-advertisement');
+    assert.equal(infoRefs.headers.get('cache-control'), 'no-cache');
+    assert.ok((await infoRefs.text()).includes(`${c1Oid} refs/heads/main\u0000`));
   } finally {
     await srv.close();
   }

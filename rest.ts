@@ -5,10 +5,9 @@ function fastDecode(seg: string): string {
   return seg.indexOf('%') >= 0 ? decodeURIComponent(seg) : seg;
 }
 
-// writeHead consumes these arrays synchronously; no response retains the template.
-// Keep Content-Length: it lets end(Buffer) send one unchunked HTTP response.
-const JSON_HEADERS = ['content-type', 'application/json; charset=utf-8', 'content-length', '', 'x-github-request-id', ''];
-const EMPTY_HEADERS = ['content-type', 'application/json; charset=utf-8', 'x-github-request-id', ''];
+const NOT_FOUND_BUF = Buffer.from('{"message":"Not Found"}', 'utf8');
+const BAD_JSON_BUF = Buffer.from('{"message":"Problems parsing JSON"}', 'utf8');
+const TITLE_REQUIRED_BUF = Buffer.from('{"message":"Validation Failed: title is required"}', 'utf8');
 
 export function sendJson(
   res: ServerResponse,
@@ -18,37 +17,30 @@ export function sendJson(
   extraHeaders?: Record<string, string>,
 ): void {
   const buf = Buffer.from(JSON.stringify(payload), 'utf8');
-  if (!extraHeaders) {
-    sendJsonBuffer(res, status, buf, requestId);
-    return;
-  }
-  const headers: Record<string, string | number> = {
-    'content-type': 'application/json; charset=utf-8',
-    'content-length': buf.length,
-    'x-github-request-id': requestId,
-  };
+  res.statusCode = status;
+  res.setHeader('content-type', 'application/json; charset=utf-8');
+  res.setHeader('content-length', buf.length);
+  res.setHeader('x-github-request-id', requestId);
   if (extraHeaders) {
-    for (const [k, v] of Object.entries(extraHeaders)) headers[k] = v;
+    for (const [k, v] of Object.entries(extraHeaders)) res.setHeader(k, v);
   }
-  res.writeHead(status, headers);
   res.end(buf);
 }
 
 export function sendJsonBuffer(res: ServerResponse, status: number, buf: Buffer, requestId: string): void {
-  JSON_HEADERS[3] = String(buf.length);
-  JSON_HEADERS[5] = requestId;
-  res.writeHead(status, JSON_HEADERS);
+  res.statusCode = status;
+  res.setHeader('content-type', 'application/json; charset=utf-8');
+  res.setHeader('content-length', buf.length);
+  res.setHeader('x-github-request-id', requestId);
   res.end(buf);
 }
 
 function sendNoContent(res: ServerResponse, requestId: string): void {
-  EMPTY_HEADERS[3] = requestId;
-  res.writeHead(204, EMPTY_HEADERS);
+  res.statusCode = 204;
+  res.setHeader('content-type', 'application/json; charset=utf-8');
+  res.setHeader('x-github-request-id', requestId);
   res.end();
 }
-
-const NOT_FOUND_BUF = Buffer.from('{"message":"Not Found"}', 'utf8');
-const BAD_JSON_BUF = Buffer.from('{"message":"Problems parsing JSON"}', 'utf8');
 
 function sendNotFound(res: ServerResponse, requestId: string): void {
   sendJsonBuffer(res, 404, NOT_FOUND_BUF, requestId);
@@ -68,6 +60,18 @@ function parseJsonBody(body: Buffer): Record<string, unknown> {
   }
 }
 
+function parseJsonObjectSafe(body: Buffer): Record<string, unknown> | null {
+  if (body.length === 0) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body.toString('utf8')) as unknown;
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  return parsed as Record<string, unknown>;
+}
+
 function parseIntStrict(raw: string): number | null {
   if (raw.length === 0) return null;
   let n = 0;
@@ -78,6 +82,90 @@ function parseIntStrict(raw: string): number | null {
     if (n > Number.MAX_SAFE_INTEGER) return null;
   }
   return n > 0 ? n : null;
+}
+
+function parseIntStrictSlice(raw: string, start: number): number | null {
+  const len = raw.length;
+  if (start >= len) return null;
+  let n = 0;
+  for (let i = start; i < len; i++) {
+    const digit = raw.charCodeAt(i) - 48;
+    if (digit < 0 || digit > 9) return null;
+    n = n * 10 + digit;
+    if (n > Number.MAX_SAFE_INTEGER) return null;
+  }
+  return n > 0 ? n : null;
+}
+
+export function tryFastGetIssue(
+  store: ForgeStore,
+  res: ServerResponse,
+  pathname: string,
+  requestId: string,
+): boolean {
+  const s1 = 14; // after '/api/v3/repos/'
+  const slash1 = pathname.indexOf('/', s1);
+  if (slash1 <= s1) return false;
+  const slash2 = pathname.indexOf('/', slash1 + 1);
+  if (slash2 <= slash1 + 1 || !pathname.startsWith('/issues/', slash2)) return false;
+  const numStart = slash2 + 8;
+  if (numStart >= pathname.length || pathname.indexOf('/', numStart) >= 0 || pathname.indexOf('%') >= 0) {
+    return false;
+  }
+  const num = parseIntStrictSlice(pathname, numStart);
+  if (num === null) return false;
+  const owner = pathname.slice(s1, slash1);
+  const repoName = pathname.slice(slash1 + 1, slash2);
+  const repo = store.findRepo(owner, repoName);
+  if (!repo) {
+    sendNotFound(res, requestId);
+    return true;
+  }
+  const issue = repo.issues.get(num);
+  if (!issue) {
+    sendNotFound(res, requestId);
+    return true;
+  }
+  sendJsonBuffer(res, 200, issue.cachedJson, requestId);
+  return true;
+}
+
+export function tryFastPostIssue(
+  store: ForgeStore,
+  res: ServerResponse,
+  pathname: string,
+  body: Buffer,
+  requestId: string,
+): boolean {
+  const s1 = 14; // after '/api/v3/repos/'
+  const slash1 = pathname.indexOf('/', s1);
+  if (slash1 <= s1) return false;
+  const slash2 = pathname.indexOf('/', slash1 + 1);
+  if (slash2 <= slash1 + 1 || slash2 + 7 !== pathname.length || pathname.indexOf('%') >= 0) {
+    return false;
+  }
+  const owner = pathname.slice(s1, slash1);
+  const repoName = pathname.slice(slash1 + 1, slash2);
+  const repo = store.findRepo(owner, repoName);
+  if (!repo) {
+    sendNotFound(res, requestId);
+    return true;
+  }
+  const data = parseJsonObjectSafe(body);
+  if (!data) {
+    sendJsonBuffer(res, 400, BAD_JSON_BUF, requestId);
+    return true;
+  }
+  if (data.labels !== undefined) return false;
+  const title = typeof data.title === 'string' ? data.title : '';
+  if (title.trim() === '') {
+    sendJsonBuffer(res, 422, TITLE_REQUIRED_BUF, requestId);
+    return true;
+  }
+  const issueBody = typeof data.body === 'string' ? data.body : undefined;
+  const created = store.createIssue(repo, { title, body: issueBody });
+  sendJsonBuffer(res, 201, created.cachedJson, requestId);
+  return true;
 }
 
 function paginate<T>(
@@ -144,87 +232,9 @@ export function handleRestRequest(
   requestId: string,
 ): void {
   const method = req.method ?? 'GET';
+  const query = queryStr !== '' ? new URLSearchParams(queryStr) : null;
 
   try {
-
-  // ULTRA-HOT PATH check before allocating URLSearchParams or splitting everything:
-  // GET /repos/<owner>/<repo>/issues/<number>
-  if (method === 'GET' && queryStr === '' && subPath.startsWith('/repos/')) {
-    const s1 = 7; // after '/repos/'
-    const slash1 = subPath.indexOf('/', s1);
-    if (slash1 > s1) {
-      const slash2 = subPath.indexOf('/', slash1 + 1);
-      if (slash2 > slash1 + 1 && subPath.startsWith('/issues/', slash2)) {
-        const restNum = subPath.slice(slash2 + 8);
-        if (restNum.length > 0 && restNum.indexOf('/') < 0) {
-          const num = parseIntStrict(restNum);
-          if (num !== null) {
-            const owner = fastDecode(subPath.slice(s1, slash1));
-            const repoName = fastDecode(subPath.slice(slash1 + 1, slash2));
-            const repo = store.findRepo(owner, repoName);
-            if (!repo) {
-              sendNotFound(res, requestId);
-              return;
-            }
-            const issue = repo.issues.get(num);
-            if (!issue) {
-              sendNotFound(res, requestId);
-              return;
-            }
-            sendJsonBuffer(res, 200, issue.cachedJson, requestId);
-            return;
-          }
-        }
-      }
-    }
-  }
-
-  // POST /repos/<owner>/<repo>/issues fast-path
-  if (method === 'POST' && queryStr === '' && subPath.startsWith('/repos/') && subPath.endsWith('/issues')) {
-    const s1 = 7;
-    const slash1 = subPath.indexOf('/', s1);
-    if (slash1 > s1) {
-      const slash2 = subPath.indexOf('/', slash1 + 1);
-      if (slash2 > slash1 + 1 && slash2 + 7 === subPath.length) {
-        try {
-          const owner = fastDecode(subPath.slice(s1, slash1));
-          const repoName = fastDecode(subPath.slice(slash1 + 1, slash2));
-          const repo = store.getRepo(owner, repoName);
-          const data = parseJsonBody(body);
-          const title = typeof data.title === 'string' ? data.title : '';
-          const issueBody = typeof data.body === 'string' ? data.body : undefined;
-          let labels: string[] | undefined;
-          if (data.labels !== undefined) {
-            if (!Array.isArray(data.labels)) {
-              throw new StoreError(422, 'Validation Failed: labels must be an array', 'invalid');
-            }
-            labels = data.labels.map((l) =>
-              typeof l === 'string'
-                ? l
-                : typeof l === 'object' && l && typeof (l as Record<string, unknown>).name === 'string'
-                  ? String((l as Record<string, unknown>).name)
-                  : '',
-            );
-          }
-          const created = store.createIssue(repo, { title, body: issueBody, labels });
-          sendJsonBuffer(res, 201, created.cachedJson, requestId);
-          return;
-        } catch (err) {
-          if (err instanceof StoreError) {
-            if (err.code === 'bad_json') {
-              sendJsonBuffer(res, 400, BAD_JSON_BUF, requestId);
-              return;
-            }
-            sendJson(res, err.status, { message: err.message }, requestId);
-            return;
-          }
-          throw err;
-        }
-      }
-    }
-  }
-
-  const query = queryStr !== '' ? new URLSearchParams(queryStr) : null;
 
     if (subPath === '' || subPath === '/') {
       if (method === 'GET') {
@@ -500,15 +510,13 @@ export function handleRestRequest(
           );
           const out = `[${pageItems.map((i) => i.cachedJson.toString('utf8')).join(',')}]`;
           const buf = Buffer.from(out, 'utf8');
-          const headers: Record<string, string | number> = {
-            'content-type': 'application/json; charset=utf-8',
-            'content-length': buf.length,
-            'x-github-request-id': requestId,
-          };
+          res.statusCode = 200;
+          res.setHeader('content-type', 'application/json; charset=utf-8');
+          res.setHeader('content-length', buf.length);
+          res.setHeader('x-github-request-id', requestId);
           if (extraHeaders) {
-            for (const [k, v] of Object.entries(extraHeaders)) headers[k] = v;
+            for (const [k, v] of Object.entries(extraHeaders)) res.setHeader(k, v);
           }
-          res.writeHead(200, headers);
           res.end(buf);
           return;
         }

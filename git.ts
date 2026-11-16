@@ -209,22 +209,6 @@ function parseReceivePackHeaderAndBody(buf: Buffer): { lines: Buffer[]; pack: Bu
   throw new Error('receive-pack missing flush packet');
 }
 
-function readVarintSize(buffer: Buffer, offset: number): { first: number; size: number; next: number } {
-  if (offset >= buffer.length) throw new Error('pack object header truncated');
-  const first = buffer[offset++]!;
-  let size = first & 0x0f;
-  let shift = 4;
-  let byte = first;
-  while (byte & 0x80) {
-    if (offset >= buffer.length) throw new Error('pack object size varint truncated');
-    byte = buffer[offset++]!;
-    size += (byte & 0x7f) * 2 ** shift;
-    shift += 7;
-    if (shift > 53) throw new Error('pack object size varint overflow');
-  }
-  return { first, size, next: offset };
-}
-
 function readOfsDeltaOffset(buffer: Buffer, offset: number): { dist: number; next: number } {
   if (offset >= buffer.length) throw new Error('ofs-delta offset truncated');
   let byte = buffer[offset++]!;
@@ -300,29 +284,44 @@ interface RawPackEntry {
   resolved?: GitObject;
 }
 
-function parsePackfile(pack: Buffer, existingObjects: ReadonlyMap<string, GitObject>): Map<string, GitObject> {
+function parsePackfileInto(pack: Buffer, targetObjects: Map<string, GitObject>): void {
   if (pack.length < 32) throw new Error('packfile too short');
-  if (pack.toString('ascii', 0, 4) !== 'PACK') throw new Error('bad packfile header');
+  if (pack[0] !== 0x50 || pack[1] !== 0x41 || pack[2] !== 0x43 || pack[3] !== 0x4b) {
+    throw new Error('bad packfile header');
+  }
   const version = pack.readUInt32BE(4);
   if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
   const count = pack.readUInt32BE(8);
   const trailerStart = pack.length - 20;
+  if (12 + count * 2 > trailerStart) throw new Error('packfile truncated');
   const expectedTrailer = pack.subarray(trailerStart);
   const actualTrailer = createHash('sha1').update(pack.subarray(0, trailerStart)).digest();
   if (!expectedTrailer.equals(actualTrailer)) {
     throw new Error('packfile checksum mismatch');
   }
 
-  const raw: RawPackEntry[] = new Array(count);
-  const unpacked = new Map<string, GitObject>();
-  let hasDelta = false;
+  const pendingObjs: GitObject[] = new Array(count);
+  const entryOffsets: number[] = new Array(count);
+  let raw: RawPackEntry[] | null = null;
+  let unpacked: Map<string, GitObject> | null = null;
   let offset = 12;
 
   for (let i = 0; i < count; i++) {
     const entryOffset = offset;
-    const hdr = readVarintSize(pack, offset);
-    offset = hdr.next;
-    const typeCode = (hdr.first >> 4) & 0x07;
+    if (offset >= trailerStart) throw new Error('pack object header truncated');
+    const first = pack[offset++]!;
+    const typeCode = (first >> 4) & 0x07;
+    let hdrSize = first & 0x0f;
+    let shift = 4;
+    let byte = first;
+    while (byte & 0x80) {
+      if (offset >= trailerStart) throw new Error('pack object size varint truncated');
+      byte = pack[offset++]!;
+      hdrSize += (byte & 0x7f) * 2 ** shift;
+      shift += 7;
+      if (shift > 53) throw new Error('pack object size varint overflow');
+    }
+
     let baseOffset: number | undefined;
     let baseOid: string | undefined;
 
@@ -332,14 +331,27 @@ function parsePackfile(pack: Buffer, existingObjects: ReadonlyMap<string, GitObj
       const baseOff = entryOffset - ofs.dist;
       if (ofs.dist <= 0 || baseOff < 12) throw new Error('invalid ofs-delta base offset');
       baseOffset = baseOff;
-      hasDelta = true;
     } else if (typeCode === 7) {
       if (offset + 20 > trailerStart) throw new Error('truncated ref-delta oid');
       baseOid = pack.toString('hex', offset, offset + 20);
       offset += 20;
-      hasDelta = true;
     } else if (!CODE_TO_TYPE[typeCode]) {
       throw new Error(`unknown pack entry type ${typeCode}`);
+    }
+
+    if ((typeCode === 6 || typeCode === 7) && raw === null) {
+      raw = new Array(count);
+      unpacked = new Map<string, GitObject>();
+      for (let k = 0; k < i; k++) {
+        const obj = pendingObjs[k]!;
+        raw[k] = {
+          offset: entryOffsets[k]!,
+          typeCode: TYPE_TO_CODE[obj.type],
+          data: obj.data,
+          resolved: obj,
+        };
+        unpacked.set(obj.oid, obj);
+      }
     }
 
     const view = pack.subarray(offset, trailerStart);
@@ -349,20 +361,28 @@ function parsePackfile(pack: Buffer, existingObjects: ReadonlyMap<string, GitObj
     };
     const consumed = inflated.engine.bytesWritten;
     if (!consumed || consumed <= 0) throw new Error('zlib consumed zero bytes');
-    if (inflated.buffer.length !== hdr.size) {
-      throw new Error(`pack entry inflated length ${inflated.buffer.length} != ${hdr.size}`);
+    if (inflated.buffer.length !== hdrSize) {
+      throw new Error(`pack entry inflated length ${inflated.buffer.length} != ${hdrSize}`);
     }
     const data = inflated.buffer;
-    const entry: RawPackEntry = { offset: entryOffset, typeCode, data, baseOffset, baseOid };
-    if (typeCode >= 1 && typeCode <= 4) {
+    offset += consumed;
+
+    if (raw === null) {
       const type = CODE_TO_TYPE[typeCode]!;
       const oid = hashObject(type, data);
-      const obj: GitObject = { type, data, oid, compressed: undefined };
-      entry.resolved = obj;
-      unpacked.set(oid, obj);
+      pendingObjs[i] = { type, data, oid, compressed: undefined };
+      entryOffsets[i] = entryOffset;
+    } else {
+      const entry: RawPackEntry = { offset: entryOffset, typeCode, data, baseOffset, baseOid };
+      if (typeCode >= 1 && typeCode <= 4) {
+        const type = CODE_TO_TYPE[typeCode]!;
+        const oid = hashObject(type, data);
+        const obj: GitObject = { type, data, oid, compressed: undefined };
+        entry.resolved = obj;
+        unpacked!.set(oid, obj);
+      }
+      raw[i] = entry;
     }
-    offset += consumed;
-    raw[i] = entry;
   }
 
   if (offset !== trailerStart) {
@@ -371,7 +391,13 @@ function parsePackfile(pack: Buffer, existingObjects: ReadonlyMap<string, GitObj
 
   // Ordinary push packs need no offset index, cycle set, or delta resolver.
   // Leave compression lazy: only upload-pack needs a compressed representation.
-  if (!hasDelta) return unpacked;
+  if (raw === null) {
+    for (let i = 0; i < count; i++) {
+      const obj = pendingObjs[i]!;
+      if (!targetObjects.has(obj.oid)) targetObjects.set(obj.oid, obj);
+    }
+    return;
+  }
 
   const byOffset = new Map<number, RawPackEntry>();
   for (const entry of raw) byOffset.set(entry.offset, entry);
@@ -393,7 +419,7 @@ function parsePackfile(pack: Buffer, existingObjects: ReadonlyMap<string, GitObj
       objData = applyDelta(base.data, entry.data);
     } else if (entry.typeCode === 7) {
       const wanted = entry.baseOid!;
-      const base = unpacked.get(wanted) ?? existingObjects.get(wanted);
+      const base = unpacked!.get(wanted) ?? targetObjects.get(wanted);
       if (!base) throw new Error(`ref-delta base ${wanted} missing`);
       objType = base.type;
       objData = applyDelta(base.data, entry.data);
@@ -406,14 +432,16 @@ function parsePackfile(pack: Buffer, existingObjects: ReadonlyMap<string, GitObj
     const oid = hashObject(objType, objData);
     const obj: GitObject = { type: objType, data: objData, oid, compressed: undefined };
     entry.resolved = obj;
-    unpacked.set(oid, obj);
+    unpacked!.set(oid, obj);
     return obj;
   };
 
   for (const entry of raw) {
     resolveEntry(entry);
   }
-  return unpacked;
+  for (const [oid, obj] of unpacked!) {
+    if (!targetObjects.has(oid)) targetObjects.set(oid, obj);
+  }
 }
 
 function writeObjectHeaderInto(buf: Buffer, pos: number, type: GitObjectType, size: number): number {
@@ -514,9 +542,60 @@ function getOkMainSidebandReport(): Buffer {
   return okMainSidebandReportBuf;
 }
 
+const RECEIVE_MAIN_PREFIX = encodePktText(['# service=git-receive-pack\n', 'flush']);
+const RECEIVE_MAIN_SUFFIX = ` refs/heads/main\u0000report-status side-band-64k delete-refs ofs-delta atomic agent=${AGENT} symref=HEAD:refs/heads/main\n0000`;
+const RECEIVE_MAIN_PKT_LEN = 4 + 40 + RECEIVE_MAIN_SUFFIX.length - 4;
+const RECEIVE_MAIN_OID_OFFSET = RECEIVE_MAIN_PREFIX.length + 4;
+const RECEIVE_MAIN_TEMPLATE = Buffer.allocUnsafe(RECEIVE_MAIN_PREFIX.length + RECEIVE_MAIN_PKT_LEN + 4);
+RECEIVE_MAIN_PREFIX.copy(RECEIVE_MAIN_TEMPLATE, 0);
+RECEIVE_MAIN_TEMPLATE.write(encodePktHexLen(RECEIVE_MAIN_PKT_LEN), RECEIVE_MAIN_PREFIX.length, 4, 'ascii');
+RECEIVE_MAIN_TEMPLATE.fill(0x30, RECEIVE_MAIN_OID_OFFSET, RECEIVE_MAIN_OID_OFFSET + 40);
+RECEIVE_MAIN_TEMPLATE.write(RECEIVE_MAIN_SUFFIX, RECEIVE_MAIN_OID_OFFSET + 40, 'ascii');
+
+const UPLOAD_V0_PREFIX = encodePktText(['# service=git-upload-pack\n', 'flush']);
+const UPLOAD_V0_HEAD_SUFFIX = ` HEAD\u0000multi_ack_detailed side-band-64k thin-pack ofs-delta shallow agent=${AGENT} symref=HEAD:refs/heads/main\n`;
+const UPLOAD_V0_HEAD_PKT_LEN = 4 + 40 + UPLOAD_V0_HEAD_SUFFIX.length;
+const UPLOAD_V0_MAIN_SUFFIX = ' refs/heads/main\n0000';
+const UPLOAD_V0_MAIN_PKT_LEN = 4 + 40 + UPLOAD_V0_MAIN_SUFFIX.length - 4;
+const UPLOAD_V0_HEAD_OID_OFFSET = UPLOAD_V0_PREFIX.length + 4;
+const UPLOAD_V0_MAIN_OID_OFFSET = UPLOAD_V0_PREFIX.length + UPLOAD_V0_HEAD_PKT_LEN + 4;
+const UPLOAD_V0_MAIN_TEMPLATE = Buffer.allocUnsafe(UPLOAD_V0_PREFIX.length + UPLOAD_V0_HEAD_PKT_LEN + UPLOAD_V0_MAIN_PKT_LEN + 4);
+UPLOAD_V0_PREFIX.copy(UPLOAD_V0_MAIN_TEMPLATE, 0);
+UPLOAD_V0_MAIN_TEMPLATE.write(encodePktHexLen(UPLOAD_V0_HEAD_PKT_LEN), UPLOAD_V0_PREFIX.length, 4, 'ascii');
+UPLOAD_V0_MAIN_TEMPLATE.fill(0x30, UPLOAD_V0_HEAD_OID_OFFSET, UPLOAD_V0_HEAD_OID_OFFSET + 40);
+UPLOAD_V0_MAIN_TEMPLATE.write(UPLOAD_V0_HEAD_SUFFIX, UPLOAD_V0_HEAD_OID_OFFSET + 40, 'ascii');
+UPLOAD_V0_MAIN_TEMPLATE.write(encodePktHexLen(UPLOAD_V0_MAIN_PKT_LEN), UPLOAD_V0_PREFIX.length + UPLOAD_V0_HEAD_PKT_LEN, 4, 'ascii');
+UPLOAD_V0_MAIN_TEMPLATE.fill(0x30, UPLOAD_V0_MAIN_OID_OFFSET, UPLOAD_V0_MAIN_OID_OFFSET + 40);
+UPLOAD_V0_MAIN_TEMPLATE.write(UPLOAD_V0_MAIN_SUFFIX, UPLOAD_V0_MAIN_OID_OFFSET + 40, 'ascii');
+
 function buildAdvertisement(repo: RepoState, service: 'git-upload-pack' | 'git-receive-pack', protocolVersion: 0 | 2): Buffer {
   if (service === 'git-upload-pack' && protocolVersion === 2) {
     return getV2UploadPackAds();
+  }
+  if (service === 'git-receive-pack') {
+    if (repo.lastReceiveAdsBuf !== null) return repo.lastReceiveAdsBuf;
+    if (repo.refs.size === 1 && repo.defaultBranch === 'main') {
+      const headOid = repo.refs.get('refs/heads/main');
+      if (headOid !== undefined) {
+        const buf = Buffer.allocUnsafe(RECEIVE_MAIN_TEMPLATE.length);
+        RECEIVE_MAIN_TEMPLATE.copy(buf);
+        buf.write(headOid, RECEIVE_MAIN_OID_OFFSET, 40, 'ascii');
+        repo.lastReceiveAdsBuf = buf;
+        return buf;
+      }
+    }
+  } else if (repo.lastUploadV0AdsBuf !== null) {
+    return repo.lastUploadV0AdsBuf;
+  } else if (repo.refs.size === 1 && repo.defaultBranch === 'main') {
+    const headOid = repo.refs.get('refs/heads/main');
+    if (headOid !== undefined && repo.objects.get(headOid)?.type !== 'tag') {
+      const buf = Buffer.allocUnsafe(UPLOAD_V0_MAIN_TEMPLATE.length);
+      UPLOAD_V0_MAIN_TEMPLATE.copy(buf);
+      buf.write(headOid, UPLOAD_V0_HEAD_OID_OFFSET, 40, 'ascii');
+      buf.write(headOid, UPLOAD_V0_MAIN_OID_OFFSET, 40, 'ascii');
+      repo.lastUploadV0AdsBuf = buf;
+      return buf;
+    }
   }
   const cacheKey = `${service}:v0`;
   const cached = repo.adsCache.get(cacheKey);
@@ -912,12 +991,43 @@ function extractCommitParentsFast(data: Buffer): string[] {
   return parents;
 }
 
+function hasDirectParent(commitData: Buffer, parentOid: string): boolean {
+  let pos = 0;
+  const end = commitData.length;
+  while (pos < end) {
+    const nl = commitData.indexOf(0x0a, pos);
+    const lineEnd = nl >= 0 ? nl : end;
+    if (lineEnd === pos) return false;
+    if (
+      lineEnd - pos >= 47 &&
+      commitData[pos] === 0x70 && // 'p'
+      commitData[pos + 1] === 0x61 && // 'a'
+      commitData[pos + 2] === 0x72 && // 'r'
+      commitData[pos + 3] === 0x65 && // 'e'
+      commitData[pos + 4] === 0x6e && // 'n'
+      commitData[pos + 5] === 0x74 && // 't'
+      commitData[pos + 6] === 0x20 // ' '
+    ) {
+      let match = true;
+      for (let i = 0; i < 40; i++) {
+        if (commitData[pos + 7 + i] !== parentOid.charCodeAt(i)) {
+          match = false;
+          break;
+        }
+      }
+      if (match) return true;
+    }
+    if (nl < 0) return false;
+    pos = nl + 1;
+  }
+  return false;
+}
+
 function isCommitAncestor(objects: ReadonlyMap<string, GitObject>, ancestor: string, descendant: string): boolean {
   if (ancestor === descendant) return true;
   const descObj = objects.get(descendant);
-  if (descObj && descObj.type === 'commit') {
-    const firstParents = extractCommitParentsFast(descObj.data);
-    if (firstParents.length === 1 && firstParents[0] === ancestor) return true;
+  if (descObj && descObj.type === 'commit' && hasDirectParent(descObj.data, ancestor)) {
+    return true;
   }
   const visited = new Set<string>();
   const stack: string[] = [descendant];
@@ -941,6 +1051,22 @@ function isCommitAncestor(objects: ReadonlyMap<string, GitObject>, ancestor: str
 function handleUploadPackPost(repo: RepoState, req: IncomingMessage, body: Buffer): { status: number; contentType: string; body: Buffer } {
   const gitProto = String(req.headers['git-protocol'] ?? '');
   const isV2 = gitProto.includes('version=2');
+  if (isV2) {
+    if (repo.lastV2FetchReq !== null && body.equals(repo.lastV2FetchReq)) {
+      return {
+        status: 200,
+        contentType: 'application/x-git-upload-pack-result',
+        body: repo.lastV2FetchRes!,
+      };
+    }
+    if (repo.lastV2LsRefsReq !== null && body.equals(repo.lastV2LsRefsReq)) {
+      return {
+        status: 200,
+        contentType: 'application/x-git-upload-pack-result',
+        body: repo.lastV2LsRefsRes!,
+      };
+    }
+  }
   const rawKey = isV2 && body.length <= 512 ? `r2:${body.toString('latin1')}` : '';
   if (rawKey) {
     const cachedRaw = repo.packCache.get(rawKey);
@@ -975,7 +1101,11 @@ function handleUploadPackPost(repo: RepoState, req: IncomingMessage, body: Buffe
 
     if (command === 'ls-refs') {
       const result = handleLsRefs(repo, args);
-      if (rawKey) cacheResponse(repo.packCache, rawKey, result);
+      if (body.length <= 512) {
+        repo.lastV2LsRefsReq = Buffer.from(body);
+        repo.lastV2LsRefsRes = result;
+        if (rawKey) cacheResponse(repo.packCache, rawKey, result);
+      }
       return {
         status: 200,
         contentType: 'application/x-git-upload-pack-result',
@@ -1007,7 +1137,11 @@ function handleUploadPackPost(repo: RepoState, req: IncomingMessage, body: Buffe
         }
       }
       const result = handleUploadPackFetch(repo, 2, wants, haves, shallow, depth, done);
-      if (rawKey && done) cacheResponse(repo.packCache, rawKey, result);
+      if (done && body.length <= 512) {
+        repo.lastV2FetchReq = Buffer.from(body);
+        repo.lastV2FetchRes = result;
+        if (rawKey) cacheResponse(repo.packCache, rawKey, result);
+      }
       return {
         status: 200,
         contentType: 'application/x-git-upload-pack-result',
@@ -1053,20 +1187,31 @@ function handleUploadPackPost(repo: RepoState, req: IncomingMessage, body: Buffe
   };
 }
 
-// Synchronous response-header tuples mutated only right before writeHead().
 const GIT_NOT_FOUND_BUF = Buffer.from('{"message":"Not Found"}', 'utf8');
 const GIT_BAD_SERVICE_BUF = Buffer.from('{"message":"Unsupported service"}', 'utf8');
-const GIT_WIRE_HEADERS = [
-  'content-type',
-  '',
-  'cache-control',
-  'no-cache',
-  'content-length',
-  '',
-  'x-github-request-id',
-  '',
-];
-const GIT_ERR_HEADERS = ['content-type', 'application/json; charset=utf-8', 'content-length', '', 'x-github-request-id', ''];
+
+function sendGitWireResponse(
+  res: ServerResponse,
+  status: number,
+  contentType: string,
+  payload: Buffer,
+  requestId: string,
+): void {
+  res.statusCode = status;
+  res.setHeader('content-type', contentType);
+  res.setHeader('cache-control', 'no-cache');
+  res.setHeader('content-length', payload.length);
+  res.setHeader('x-github-request-id', requestId);
+  res.end(payload);
+}
+
+function sendGitJsonError(res: ServerResponse, status: number, errBuf: Buffer, requestId: string): void {
+  res.statusCode = status;
+  res.setHeader('content-type', 'application/json; charset=utf-8');
+  res.setHeader('content-length', errBuf.length);
+  res.setHeader('x-github-request-id', requestId);
+  res.end(errBuf);
+}
 
 function hasCapabilityToken(capPart: string, token: string): boolean {
   let pos = 0;
@@ -1081,76 +1226,44 @@ function hasCapabilityToken(capPart: string, token: string): boolean {
   }
 }
 
-function handleReceivePackPost(
+const MAIN_REF_BUF = Buffer.from('refs/heads/main', 'ascii');
+
+function checkHex40(buf: Buffer, offset: number): 0 | 1 | 2 {
+  let hasUpper = false;
+  for (let i = 0; i < 40; i++) {
+    const c = buf[offset + i]!;
+    if ((c >= 0x30 && c <= 0x39) || (c >= 0x61 && c <= 0x66)) continue;
+    if (c >= 0x41 && c <= 0x46) {
+      hasUpper = true;
+      continue;
+    }
+    return 0;
+  }
+  return hasUpper ? 2 : 1;
+}
+
+function hasSideband64kBytes(buf: Buffer, start: number, end: number): boolean {
+  let pos = start;
+  while (pos < end) {
+    const idx = buf.indexOf('side-band-64k', pos, 'ascii');
+    if (idx < 0 || idx + 13 > end) return false;
+    const beforeOk = idx === start || buf[idx - 1] === 0x20;
+    const afterIdx = idx + 13;
+    const afterOk = afterIdx === end || buf[afterIdx] === 0x20 || buf[afterIdx] === 0x0a;
+    if (beforeOk && afterOk) return true;
+    pos = idx + 1;
+  }
+  return false;
+}
+
+function applyReceivePackCommands(
   store: ForgeStore,
   repo: RepoState,
-  body: Buffer,
+  commands: ReadonlyArray<{ oldOid: string; newOid: string; ref: string }>,
+  useSideband: boolean,
+  unpackOk: boolean,
+  unpackError: string,
 ): { status: number; contentType: string; body: Buffer } {
-  const { lines, pack } = parseReceivePackHeaderAndBody(body);
-  if (lines.length === 0) {
-    return {
-      status: 400,
-      contentType: 'application/json; charset=utf-8',
-      body: Buffer.from(JSON.stringify({ message: 'Empty receive-pack command list' })),
-    };
-  }
-
-  let useSideband = false;
-  const commands: Array<{ oldOid: string; newOid: string; ref: string }> = new Array(lines.length);
-  for (let i = 0; i < lines.length; i++) {
-    let raw = lines[i]!.toString('utf8');
-    if (i === 0) {
-      const nul = raw.indexOf('\u0000');
-      if (nul >= 0) {
-        useSideband = hasCapabilityToken(raw.slice(nul + 1), 'side-band-64k');
-        raw = raw.slice(0, nul);
-      }
-    }
-    if (raw.endsWith('\n')) raw = raw.slice(0, -1);
-    const sp1 = raw.indexOf(' ');
-    const sp2 = sp1 >= 0 ? raw.indexOf(' ', sp1 + 1) : -1;
-    if (sp1 < 0 || sp2 < 0) throw new Error(`malformed receive-pack command: ${raw}`);
-    const oldOid = raw.slice(0, sp1).toLowerCase();
-    const newOid = raw.slice(sp1 + 1, sp2).toLowerCase();
-    const ref = raw.slice(sp2 + 1);
-    if (!isOid(oldOid) || !isOid(newOid) || !ref) throw new Error('invalid receive-pack command fields');
-    commands[i] = { oldOid, newOid, ref };
-  }
-
-  let unpackOk = true;
-  let unpackError = '';
-  if (pack.length > 0) {
-    try {
-      const unpacked = parsePackfile(pack, repo.objects);
-      for (const [oid, obj] of unpacked) {
-        if (!repo.objects.has(oid)) repo.objects.set(oid, obj);
-      }
-    } catch (err) {
-      unpackOk = false;
-      unpackError = err instanceof Error ? err.message : String(err);
-    }
-  }
-
-  // Fast path: single fast-forward or create push to refs/heads/main avoids array/string building.
-  if (unpackOk && commands.length === 1 && commands[0]!.ref === 'refs/heads/main') {
-    const cmd = commands[0]!;
-    const current = repo.refs.get('refs/heads/main');
-    if (
-      cmd.newOid !== ZERO_OID &&
-      repo.objects.has(cmd.newOid) &&
-      ((cmd.oldOid === ZERO_OID && (current === undefined || current === cmd.newOid)) ||
-        (current !== undefined && current === cmd.oldOid && isCommitAncestor(repo.objects, current, cmd.newOid)))
-    ) {
-      repo.refs.set('refs/heads/main', cmd.newOid);
-      store.invalidateRepoPackCaches(repo);
-      return {
-        status: 200,
-        contentType: 'application/x-git-receive-pack-result',
-        body: useSideband ? getOkMainSidebandReport() : getOkMainPlainReport(),
-      };
-    }
-  }
-
   const reportLines: Array<string | 'flush'> = [];
   if (!unpackOk) {
     reportLines.push(`unpack ${unpackError || 'error'}\n`);
@@ -1234,6 +1347,139 @@ function handleReceivePackPost(
   };
 }
 
+function handleReceivePackPost(
+  store: ForgeStore,
+  repo: RepoState,
+  body: Buffer,
+): { status: number; contentType: string; body: Buffer } {
+  // Zero-array-alloc fast path for single-command push to refs/heads/main.
+  if (body.length >= 8) {
+    const firstLen = readPktHexLen(body, 0);
+    if (firstLen >= 87 && firstLen <= 65520 && firstLen + 4 <= body.length && readPktHexLen(body, firstLen) === 0) {
+      const cmdStart = 4;
+      const cmdEnd = firstLen;
+      if (cmdEnd - cmdStart >= 83 && body[cmdStart + 40] === 0x20 && body[cmdStart + 81] === 0x20) {
+        const oldHex = checkHex40(body, cmdStart);
+        const newHex = checkHex40(body, cmdStart + 41);
+        if (oldHex !== 0 && newHex !== 0) {
+          const nulIdx = body.indexOf(0, cmdStart + 82);
+          let useSideband = false;
+          let refEnd: number;
+          if (nulIdx >= 0 && nulIdx < cmdEnd) {
+            refEnd = nulIdx;
+            useSideband = hasSideband64kBytes(body, nulIdx + 1, cmdEnd);
+          } else {
+            refEnd = cmdEnd > cmdStart + 82 && body[cmdEnd - 1] === 0x0a ? cmdEnd - 1 : cmdEnd;
+          }
+          if (refEnd - (cmdStart + 82) === 15 && body.compare(MAIN_REF_BUF, 0, 15, cmdStart + 82, refEnd) === 0) {
+            const rawOld = body.toString('ascii', cmdStart, cmdStart + 40);
+            const rawNew = body.toString('ascii', cmdStart + 41, cmdStart + 81);
+            const oldOid = oldHex === 2 ? rawOld.toLowerCase() : rawOld;
+            const newOid = newHex === 2 ? rawNew.toLowerCase() : rawNew;
+            const pack = body.subarray(firstLen + 4);
+            let unpackOk = true;
+            let unpackError = '';
+            if (pack.length > 0) {
+              try {
+                parsePackfileInto(pack, repo.objects);
+              } catch (err) {
+                unpackOk = false;
+                unpackError = err instanceof Error ? err.message : String(err);
+              }
+            }
+            if (unpackOk && newOid !== ZERO_OID && repo.objects.has(newOid)) {
+              const current = repo.refs.get('refs/heads/main');
+              if (
+                (oldOid === ZERO_OID && (current === undefined || current === newOid)) ||
+                (current !== undefined && current === oldOid && isCommitAncestor(repo.objects, current, newOid))
+              ) {
+                repo.refs.set('refs/heads/main', newOid);
+                store.invalidateRepoPackCaches(repo);
+                return {
+                  status: 200,
+                  contentType: 'application/x-git-receive-pack-result',
+                  body: useSideband ? getOkMainSidebandReport() : getOkMainPlainReport(),
+                };
+              }
+            }
+            return applyReceivePackCommands(
+              store,
+              repo,
+              [{ oldOid, newOid, ref: 'refs/heads/main' }],
+              useSideband,
+              unpackOk,
+              unpackError,
+            );
+          }
+        }
+      }
+    }
+  }
+
+  const { lines, pack } = parseReceivePackHeaderAndBody(body);
+  if (lines.length === 0) {
+    return {
+      status: 400,
+      contentType: 'application/json; charset=utf-8',
+      body: Buffer.from(JSON.stringify({ message: 'Empty receive-pack command list' })),
+    };
+  }
+
+  let useSideband = false;
+  const commands: Array<{ oldOid: string; newOid: string; ref: string }> = new Array(lines.length);
+  for (let i = 0; i < lines.length; i++) {
+    let raw = lines[i]!.toString('utf8');
+    if (i === 0) {
+      const nul = raw.indexOf('\u0000');
+      if (nul >= 0) {
+        useSideband = hasCapabilityToken(raw.slice(nul + 1), 'side-band-64k');
+        raw = raw.slice(0, nul);
+      }
+    }
+    if (raw.endsWith('\n')) raw = raw.slice(0, -1);
+    const sp1 = raw.indexOf(' ');
+    const sp2 = sp1 >= 0 ? raw.indexOf(' ', sp1 + 1) : -1;
+    if (sp1 < 0 || sp2 < 0) throw new Error(`malformed receive-pack command: ${raw}`);
+    const oldOid = raw.slice(0, sp1).toLowerCase();
+    const newOid = raw.slice(sp1 + 1, sp2).toLowerCase();
+    const ref = raw.slice(sp2 + 1);
+    if (!isOid(oldOid) || !isOid(newOid) || !ref) throw new Error('invalid receive-pack command fields');
+    commands[i] = { oldOid, newOid, ref };
+  }
+
+  let unpackOk = true;
+  let unpackError = '';
+  if (pack.length > 0) {
+    try {
+      parsePackfileInto(pack, repo.objects);
+    } catch (err) {
+      unpackOk = false;
+      unpackError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  if (unpackOk && commands.length === 1 && commands[0]!.ref === 'refs/heads/main') {
+    const cmd = commands[0]!;
+    const current = repo.refs.get('refs/heads/main');
+    if (
+      cmd.newOid !== ZERO_OID &&
+      repo.objects.has(cmd.newOid) &&
+      ((cmd.oldOid === ZERO_OID && (current === undefined || current === cmd.newOid)) ||
+        (current !== undefined && current === cmd.oldOid && isCommitAncestor(repo.objects, current, cmd.newOid)))
+    ) {
+      repo.refs.set('refs/heads/main', cmd.newOid);
+      store.invalidateRepoPackCaches(repo);
+      return {
+        status: 200,
+        contentType: 'application/x-git-receive-pack-result',
+        body: useSideband ? getOkMainSidebandReport() : getOkMainPlainReport(),
+      };
+    }
+  }
+
+  return applyReceivePackCommands(store, repo, commands, useSideband, unpackOk, unpackError);
+}
+
 export function handleGitGetInfoRefs(
   store: ForgeStore,
   req: IncomingMessage,
@@ -1245,30 +1491,22 @@ export function handleGitGetInfoRefs(
 ): void {
   const repo = store.findRepo(owner, repoName);
   if (!repo) {
-    GIT_ERR_HEADERS[3] = String(GIT_NOT_FOUND_BUF.length);
-    GIT_ERR_HEADERS[5] = requestId;
-    res.writeHead(404, GIT_ERR_HEADERS);
-    res.end(GIT_NOT_FOUND_BUF);
+    sendGitJsonError(res, 404, GIT_NOT_FOUND_BUF, requestId);
     return;
   }
   if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
-    GIT_ERR_HEADERS[3] = String(GIT_BAD_SERVICE_BUF.length);
-    GIT_ERR_HEADERS[5] = requestId;
-    res.writeHead(400, GIT_ERR_HEADERS);
-    res.end(GIT_BAD_SERVICE_BUF);
+    sendGitJsonError(res, 400, GIT_BAD_SERVICE_BUF, requestId);
     return;
   }
 
   const gitProto = String(req.headers['git-protocol'] ?? '');
   const version: 0 | 2 = service === 'git-upload-pack' && gitProto.includes('version=2') ? 2 : 0;
   const payload = buildAdvertisement(repo, service, version);
-
-  GIT_WIRE_HEADERS[1] =
-    service === 'git-upload-pack' ? 'application/x-git-upload-pack-advertisement' : 'application/x-git-receive-pack-advertisement';
-  GIT_WIRE_HEADERS[5] = String(payload.length);
-  GIT_WIRE_HEADERS[7] = requestId;
-  res.writeHead(200, GIT_WIRE_HEADERS);
-  res.end(payload);
+  const contentType =
+    service === 'git-upload-pack'
+      ? 'application/x-git-upload-pack-advertisement'
+      : 'application/x-git-receive-pack-advertisement';
+  sendGitWireResponse(res, 200, contentType, payload, requestId);
 }
 
 export function handleGitPostService(
@@ -1283,10 +1521,7 @@ export function handleGitPostService(
 ): void {
   const repo = store.findRepo(owner, repoName);
   if (!repo) {
-    GIT_ERR_HEADERS[3] = String(GIT_NOT_FOUND_BUF.length);
-    GIT_ERR_HEADERS[5] = requestId;
-    res.writeHead(404, GIT_ERR_HEADERS);
-    res.end(GIT_NOT_FOUND_BUF);
+    sendGitJsonError(res, 404, GIT_NOT_FOUND_BUF, requestId);
     return;
   }
 
@@ -1295,17 +1530,10 @@ export function handleGitPostService(
       service === 'git-upload-pack'
         ? handleUploadPackPost(repo, req, body)
         : handleReceivePackPost(store, repo, body);
-    GIT_WIRE_HEADERS[1] = reply.contentType;
-    GIT_WIRE_HEADERS[5] = String(reply.body.length);
-    GIT_WIRE_HEADERS[7] = requestId;
-    res.writeHead(reply.status, GIT_WIRE_HEADERS);
-    res.end(reply.body);
+    sendGitWireResponse(res, reply.status, reply.contentType, reply.body, requestId);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     const jsonErr = Buffer.from(JSON.stringify({ message }));
-    GIT_ERR_HEADERS[3] = String(jsonErr.length);
-    GIT_ERR_HEADERS[5] = requestId;
-    res.writeHead(400, GIT_ERR_HEADERS);
-    res.end(jsonErr);
+    sendGitJsonError(res, 400, jsonErr, requestId);
   }
 }

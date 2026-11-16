@@ -279,12 +279,11 @@ export function handleMcpRequest(
       : {};
 
   if (!hasId || method.startsWith('notifications/')) {
-    res.writeHead(202, {
-      'content-type': 'application/json; charset=utf-8',
-      'content-length': 2,
-      'x-github-request-id': requestId,
-      ...extraHeaders,
-    });
+    res.statusCode = 202;
+    res.setHeader('content-type', 'application/json; charset=utf-8');
+    res.setHeader('content-length', 2);
+    res.setHeader('x-github-request-id', requestId);
+    for (const [k, v] of Object.entries(extraHeaders)) res.setHeader(k, v);
     res.end('{}');
     return;
   }

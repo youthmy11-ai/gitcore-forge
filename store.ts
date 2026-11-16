@@ -105,6 +105,12 @@ export interface RepoState {
   readonly pullList: PullRecord[];
   readonly packCache: Map<string, Buffer>;
   readonly adsCache: Map<string, Buffer>;
+  lastReceiveAdsBuf: Buffer | null;
+  lastUploadV0AdsBuf: Buffer | null;
+  lastV2LsRefsReq: Buffer | null;
+  lastV2LsRefsRes: Buffer | null;
+  lastV2FetchReq: Buffer | null;
+  lastV2FetchRes: Buffer | null;
 }
 
 export class StoreError extends Error {
@@ -120,6 +126,10 @@ export class StoreError extends Error {
 
 export function encodeNodeId(kind: 'Repo' | 'Issue' | 'PR' | 'Comment' | 'Label', ...parts: Array<number | string>): string {
   return Buffer.from(`${kind}:${parts.join(':')}`, 'utf8').toString('base64url');
+}
+
+function encodeIssueNodeId(repoId: number, number: number): string {
+  return Buffer.from(`Issue:${repoId}:${number}`, 'ascii').toString('base64url');
 }
 
 export type DecodedNodeId =
@@ -188,12 +198,25 @@ function normalizeBranchName(input: string, ownerLogin: string): string {
 
 const TWO_DIGITS = Array.from({ length: 60 }, (_, i) => (i < 10 ? `0${i}` : String(i)));
 const VIEWER_PUBLIC = { login: VIEWER.login, id: VIEWER.id };
+const VIEWER_USER_JSON = `{"login":"${VIEWER.login}","id":${VIEWER.id}}`;
 const EMPTY_LABEL_RECORDS: LabelRecord[] = [];
 const EMPTY_LABEL_PAYLOADS: Array<Record<string, unknown>> = [];
+
+export function fastJsonString(value: string): string {
+  const len = value.length;
+  for (let i = 0; i < len; i++) {
+    const c = value.charCodeAt(i);
+    if (c < 0x20 || c === 0x22 || c === 0x5c || (c >= 0xd800 && c <= 0xdfff)) {
+      return JSON.stringify(value);
+    }
+  }
+  return `"${value}"`;
+}
 
 export class ForgeStore {
   readonly baseEpochSec: number;
   private clockOffset = 0;
+  private lastClockEpoch = DEFAULT_EPOCH_SEC;
   private cachedMinute = -1;
   private cachedMinutePrefix = '';
   private reqCounter = 0;
@@ -206,12 +229,16 @@ export class ForgeStore {
   readonly reposByKey = new Map<string, RepoState>();
   readonly reposById = new Map<number, RepoState>();
   readonly reposList: RepoState[] = [];
+  private readonly reposByExactName = new Map<string, RepoState>();
+  private readonly reposByLowerName = new Map<string, RepoState>();
+  private cachedRepoExactName = '';
   private cachedOwnerLower = '';
   private cachedRepoLower = '';
   private cachedRepo: RepoState | null = null;
 
   constructor() {
     this.baseEpochSec = parseTrialBaseEpochSec();
+    this.lastClockEpoch = this.baseEpochSec;
   }
 
   nextRequestId(): string {
@@ -219,19 +246,17 @@ export class ForgeStore {
     return `gf-${this.reqCounter}`;
   }
 
-  private nextClock(): { epochSec: number; iso: string } {
+  private nextClockIso(): string {
     this.clockOffset += 1;
     const epochSec = this.baseEpochSec + this.clockOffset;
+    this.lastClockEpoch = epochSec;
     const minute = Math.floor(epochSec / 60);
     if (minute !== this.cachedMinute) {
       this.cachedMinute = minute;
       this.cachedMinutePrefix = new Date(minute * 60_000).toISOString().slice(0, 17);
     }
     const sec = epochSec - minute * 60;
-    return {
-      epochSec,
-      iso: `${this.cachedMinutePrefix}${TWO_DIGITS[sec]!}.000Z`,
-    };
+    return `${this.cachedMinutePrefix}${TWO_DIGITS[sec]!}.000Z`;
   }
 
   repoKey(owner: string, name: string): string {
@@ -247,23 +272,42 @@ export class ForgeStore {
   }
 
   findRepo(owner: string, name: string): RepoState | null {
-    if (
-      this.cachedRepo !== null &&
-      owner === this.cachedOwnerLower &&
-      name === this.cachedRepoLower
-    ) {
+    if (this.cachedRepo !== null && owner === VIEWER.login && name === this.cachedRepoExactName) {
       return this.cachedRepo;
+    }
+    if (owner === VIEWER.login) {
+      const exact = this.reposByExactName.get(name);
+      if (exact !== undefined) {
+        this.cachedRepo = exact;
+        this.cachedRepoExactName = exact.name;
+        this.cachedOwnerLower = VIEWER.login;
+        this.cachedRepoLower = exact.name.toLowerCase();
+        return exact;
+      }
+      const rLow = name.toLowerCase();
+      if (this.cachedRepo !== null && rLow === this.cachedRepoLower) {
+        return this.cachedRepo;
+      }
+      const repo = this.reposByLowerName.get(rLow) ?? null;
+      if (repo !== null) {
+        this.cachedOwnerLower = VIEWER.login;
+        this.cachedRepoLower = rLow;
+        this.cachedRepoExactName = repo.name;
+        this.cachedRepo = repo;
+      }
+      return repo;
     }
     const oLow = owner.toLowerCase();
     if (oLow !== VIEWER.login) return null;
     const rLow = name.toLowerCase();
-    if (this.cachedRepo !== null && oLow === this.cachedOwnerLower && rLow === this.cachedRepoLower) {
+    if (this.cachedRepo !== null && rLow === this.cachedRepoLower) {
       return this.cachedRepo;
     }
-    const repo = this.reposByKey.get(`${oLow}/${rLow}`) ?? null;
+    const repo = this.reposByLowerName.get(rLow) ?? null;
     if (repo !== null) {
       this.cachedOwnerLower = oLow;
       this.cachedRepoLower = rLow;
+      this.cachedRepoExactName = repo.name;
       this.cachedRepo = repo;
     }
     return repo;
@@ -274,11 +318,12 @@ export class ForgeStore {
     if (!name || name.length > 100 || name === '.' || name === '..' || name.includes('/') || name.includes('\\')) {
       throw new StoreError(422, 'Repository name is invalid', 'invalid');
     }
-    const key = this.repoKey(VIEWER.login, name);
-    if (this.reposByKey.has(key)) {
+    const nameLow = name.toLowerCase();
+    if (this.reposByLowerName.has(nameLow)) {
       throw new StoreError(422, 'Repository creation failed.', 'already_exists');
     }
-    const { iso } = this.nextClock();
+    const key = `${VIEWER.login}/${nameLow}`;
+    const iso = this.nextClockIso();
     const id = this.nextRepoIdVal++;
     const defaultBranch = (input.defaultBranch ?? 'main').trim() || 'main';
     const repo: RepoState = {
@@ -302,8 +347,16 @@ export class ForgeStore {
       pullList: [],
       packCache: new Map(),
       adsCache: new Map(),
+      lastReceiveAdsBuf: null,
+      lastUploadV0AdsBuf: null,
+      lastV2LsRefsReq: null,
+      lastV2LsRefsRes: null,
+      lastV2FetchReq: null,
+      lastV2FetchRes: null,
     };
     this.reposByKey.set(key, repo);
+    this.reposByExactName.set(name, repo);
+    this.reposByLowerName.set(nameLow, repo);
     this.reposById.set(id, repo);
     this.reposList.push(repo);
     return repo;
@@ -316,7 +369,7 @@ export class ForgeStore {
       repo.defaultBranch = patch.defaultBranch.trim();
       this.invalidateRepoPackCaches(repo);
     }
-    repo.updatedAt = this.nextClock().iso;
+    repo.updatedAt = this.nextClockIso();
     return repo;
   }
 
@@ -324,10 +377,14 @@ export class ForgeStore {
     const repo = this.getRepo(owner, name);
     if (this.cachedRepo === repo) {
       this.cachedRepo = null;
+      this.cachedRepoExactName = '';
       this.cachedOwnerLower = '';
       this.cachedRepoLower = '';
     }
-    this.reposByKey.delete(this.repoKey(repo.owner, repo.name));
+    const nameLow = repo.name.toLowerCase();
+    this.reposByKey.delete(`${repo.owner.toLowerCase()}/${nameLow}`);
+    this.reposByExactName.delete(repo.name);
+    this.reposByLowerName.delete(nameLow);
     this.reposById.delete(repo.id);
     const idx = this.reposList.indexOf(repo);
     if (idx >= 0) this.reposList.splice(idx, 1);
@@ -337,6 +394,12 @@ export class ForgeStore {
     repo.refVersion += 1;
     repo.packCache.clear();
     repo.adsCache.clear();
+    repo.lastReceiveAdsBuf = null;
+    repo.lastUploadV0AdsBuf = null;
+    repo.lastV2LsRefsReq = null;
+    repo.lastV2LsRefsRes = null;
+    repo.lastV2FetchReq = null;
+    repo.lastV2FetchRes = null;
   }
 
   serializeRepo(repo: RepoState): Record<string, unknown> {
@@ -560,7 +623,8 @@ export class ForgeStore {
     mutable.set(cleanPath, { oid: blobObj.oid, mode: '100644' });
 
     const newTreeOid = buildTreeFromFlat(repo.objects, mutable);
-    const { epochSec } = this.nextClock();
+    this.nextClockIso();
+    const epochSec = this.lastClockEpoch;
     const commitData = buildCommit({
       tree: newTreeOid,
       parents: parentOid ? [parentOid] : [],
@@ -624,7 +688,8 @@ export class ForgeStore {
     }
 
     const newTreeOid = buildTreeFromFlat(repo.objects, mutable);
-    const { epochSec } = this.nextClock();
+    this.nextClockIso();
+    const epochSec = this.lastClockEpoch;
     const commitData = buildCommit({
       tree: newTreeOid,
       parents: [parentOid],
@@ -676,6 +741,16 @@ export class ForgeStore {
   }
 
   private refreshIssueCache(issue: IssueRecord): void {
+    if (
+      issue.labels.length === 0 &&
+      issue.userLogin === VIEWER.login &&
+      issue.userId === VIEWER.id
+    ) {
+      const closedJson = issue.closedAt === null ? 'null' : `"${issue.closedAt}"`;
+      const json = `{"id":${issue.id},"node_id":"${issue.nodeId}","number":${issue.number},"title":${fastJsonString(issue.title)},"body":${fastJsonString(issue.body)},"state":"${issue.state}","labels":[],"comments":${issue.comments.length},"user":${VIEWER_USER_JSON},"created_at":"${issue.createdAt}","updated_at":"${issue.updatedAt}","closed_at":${closedJson}}`;
+      issue.cachedJson = Buffer.from(json, 'utf8');
+      return;
+    }
     const labels =
       issue.labels.length === 0
         ? EMPTY_LABEL_PAYLOADS
@@ -724,13 +799,14 @@ export class ForgeStore {
         resolvedLabels.push(found);
       }
     }
-    const { epochSec, iso } = this.nextClock();
+    const iso = this.nextClockIso();
+    const epochSec = this.lastClockEpoch;
     const id = this.nextItemIdVal++;
     const number = repo.nextNumber++;
     const seq = this.nextSeqVal++;
     const issue: IssueRecord = {
       id,
-      nodeId: encodeNodeId('Issue', repo.id, number),
+      nodeId: encodeIssueNodeId(repo.id, number),
       number,
       seq,
       title,
@@ -775,13 +851,13 @@ export class ForgeStore {
         throw new StoreError(422, 'Validation Failed: invalid state', 'invalid');
       }
       if (patch.state === 'closed' && issue.state !== 'closed') {
-        issue.closedAt = this.nextClock().iso;
+        issue.closedAt = this.nextClockIso();
       } else if (patch.state === 'open') {
         issue.closedAt = null;
       }
       issue.state = patch.state;
     }
-    issue.updatedAt = this.nextClock().iso;
+    issue.updatedAt = this.nextClockIso();
     this.refreshIssueCache(issue);
     return issue;
   }
@@ -797,7 +873,7 @@ export class ForgeStore {
     if (typeof bodyText !== 'string' || bodyText.length === 0) {
       throw new StoreError(422, 'Validation Failed: body is required', 'invalid');
     }
-    const { iso } = this.nextClock();
+    const iso = this.nextClockIso();
     const id = this.nextCommentIdVal++;
     const comment: CommentRecord = {
       id,
@@ -919,7 +995,7 @@ export class ForgeStore {
     if (!input.title || input.title.trim() === '') {
       throw new StoreError(422, 'Validation Failed: title is required', 'invalid');
     }
-    const { iso } = this.nextClock();
+    const iso = this.nextClockIso();
     const id = this.nextItemIdVal++;
     const number = repo.nextNumber++;
     const seq = this.nextSeqVal++;
@@ -1048,7 +1124,8 @@ export class ForgeStore {
     const newTreeOid = buildTreeFromFlat(repo.objects, mergedResult.files);
     const method = (options.mergeMethod ?? 'squash').toLowerCase();
     const parents = method === 'merge' ? [baseTip, headTip] : [baseTip];
-    const { epochSec, iso } = this.nextClock();
+    const iso = this.nextClockIso();
+    const epochSec = this.lastClockEpoch;
     const message = options.commitTitle ?? `${pr.title} (#${pr.number})`;
     const commitData = buildCommit({
       tree: newTreeOid,
