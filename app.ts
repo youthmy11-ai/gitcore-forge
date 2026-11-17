@@ -10,6 +10,12 @@ export interface AppOptions {
 }
 
 const HEALTHZ_BUF = Buffer.from('{"ok":true}', 'utf8');
+const HEALTHZ_HEADERS = [
+  'content-type',
+  'application/json; charset=utf-8',
+  'content-length',
+  String(HEALTHZ_BUF.length),
+];
 const UNAUTH_BUF = Buffer.from('{"message":"Requires authentication"}', 'utf8');
 const NOT_FOUND_BUF = Buffer.from('{"message":"Not Found"}', 'utf8');
 const EMPTY_BUF = Buffer.alloc(0);
@@ -113,9 +119,7 @@ export function createApp(options: AppOptions = {}): Server {
       const method = req.method ?? 'GET';
 
       if (method === 'GET' && pathname === '/healthz') {
-        res.statusCode = 200;
-        res.setHeader('content-type', 'application/json; charset=utf-8');
-        res.setHeader('content-length', HEALTHZ_BUF.length);
+        res.writeHead(200, HEALTHZ_HEADERS);
         res.end(HEALTHZ_BUF);
         return;
       }

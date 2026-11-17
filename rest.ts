@@ -28,10 +28,14 @@ export function sendJson(
 }
 
 export function sendJsonBuffer(res: ServerResponse, status: number, buf: Buffer, requestId: string): void {
-  res.statusCode = status;
-  res.setHeader('content-type', 'application/json; charset=utf-8');
-  res.setHeader('content-length', buf.length);
-  res.setHeader('x-github-request-id', requestId);
+  res.writeHead(status, [
+    'content-type',
+    'application/json; charset=utf-8',
+    'content-length',
+    String(buf.length),
+    'x-github-request-id',
+    requestId,
+  ]);
   res.end(buf);
 }
 
